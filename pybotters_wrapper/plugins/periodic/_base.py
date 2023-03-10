@@ -1,11 +1,13 @@
 import asyncio
 from collections import deque
 from typing import Callable
+from loguru import logger
 
 from .._base import Plugin
+from ..mixins import PublishQueueMixin
 
 
-class PeriodicPlugin(Plugin):
+class PeriodicPlugin(PublishQueueMixin, Plugin):
     def __init__(
         self,
         fn: Callable,
@@ -18,20 +20,29 @@ class PeriodicPlugin(Plugin):
         self._fn = fn
         self._params = params
         self._interval = interval
-        self._handle = handler
+        self._handler = handler
         self._is_coro_fn = asyncio.iscoroutinefunction(self._fn)
         self._is_coro_params = asyncio.iscoroutinefunction(self._params)
-        self._is_coro_handler = asyncio.iscoroutinefunction(self._handle)
-        self._task = asyncio.create_task(self._periodic_run())
+        self._is_coro_handler = asyncio.iscoroutinefunction(self._handler)
+        self._task = asyncio.create_task(self._periodic_execute())
         self._history = deque(maxlen=history)
+        self.init_publish_queue()
 
-    async def _periodic_run(self):
+    async def execute(self):
+        params = await self._get_params()
+        item = await self._call(params)
+        item = await self._handle(item)
+        self._history.append(item)
+        self.put(item)
+
+    @logger.catch
+    async def _execute(self):
+        """_periodic_executeでexceptionをcatchするためのwrapper"""
+        await self.execute()
+
+    async def _periodic_execute(self):
         while True:
-            params = await self._get_params()
-            item = await self._call(params)
-            item = await self._handle(item)
-            self._history.append(item)
-            self.put(item)
+            await self._execute()
             await asyncio.sleep(self._interval)
 
     async def _get_params(self) -> dict:
@@ -39,7 +50,7 @@ class PeriodicPlugin(Plugin):
             return {}
         elif isinstance(self._params, dict):
             return self._params
-        elif callable(self._fn):
+        elif callable(self._params):
             if self._is_coro_params:
                 return await self._params()
             else:
@@ -56,13 +67,16 @@ class PeriodicPlugin(Plugin):
             return self._fn(**params)
 
     async def _handle(self, item: any) -> any:
-        if self._handle is None:
+        if self._handler is None:
             return item
         else:
             if self._is_coro_handler:
-                return await self._handle(item)
+                return await self._handler(item)
             else:
-                return self._handle(item)
+                return self._handler(item)
+
+    def stop(self):
+        self._task.cancel()
 
     @property
     def task(self) -> asyncio.Task:
